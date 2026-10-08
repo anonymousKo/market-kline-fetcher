@@ -1,11 +1,27 @@
 name: Fetch K-Line CSV
 
-# 触发条件
 on:
-  workflow_dispatch: # 支持网页端手动点击“立即运行”
+  # 手动触发：配置可输入的参数
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: '标的代码（多个用英文逗号隔开）'
+        required: false
+        default: 'GC=F,MU,NVDA,SOXQ'
+        type: string
+      period:
+        description: '数据时间跨度'
+        required: false
+        default: '3mo'
+        type: choice
+        options:
+          - '1mo'
+          - '3mo'
+          - '6mo'
+          - '1y'
+
+  # 定时任务：每周一至周五 UTC 21:30 自动执行（使用默认参数）
   schedule:
-    # 定时任务：每周一至周五 UTC 时间 21:30 自动执行（Cron 使用 UTC 时区）
-    # 对应北京时间（UTC+8）次日凌晨 05:30（美股收盘结算后）
     - cron: '30 21 * * 1-5'
 
 jobs:
@@ -13,32 +29,30 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. 拉取仓库代码
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # 2. 配置 Python 3.11 环境
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip' # 自动缓存 pip 依赖，提速后续运行
+          cache: 'pip'
 
-      # 3. 安装依赖包
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 4. 执行抓取脚本
+      # 将 GitHub 界面输入的参数传递给 Python 脚本
       - name: Execute Fetch Script
         run: |
-          python fetch_data.py
+          python fetch_data.py \
+            --tickers "${{ inputs.tickers }}" \
+            --period "${{ inputs.period }}"
 
-      # 5. 上传所有抓取的 CSV 文件夹为构建产物
       - name: Upload CSV Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: all-kline-data
-          path: kline_data/            # 关键修改：指向保存所有 CSV 的文件夹
+          path: kline_data/
           retention-days: 7
