@@ -35,10 +35,10 @@ jobs:
         run: |
           python fetch_data.py
 
-      # 5. 上传 CSV 文件为构建产物（保存 7 天供随时打包下载）
-      - name: Upload CSV Artifact
+      # 5. 上传所有抓取的 CSV 文件夹为构建产物
+      - name: Upload CSV Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: latest-kline-data
-          path: latest_kline.csv
+          name: all-kline-data
+          path: kline_data/            # 关键修改：指向保存所有 CSV 的文件夹
           retention-days: 7
