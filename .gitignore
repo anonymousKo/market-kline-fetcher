@@ -1,0 +1,16 @@
+# 虚拟环境
+.venv/
+venv/
+
+# 密钥与本地配置（绝不提交）
+.env
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# 生成的数据与报告
+kline_data/
+reports/

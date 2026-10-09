@@ -1,2 +1,4 @@
 yfinance>=0.2.36
 pandas>=2.0.0
+openai>=1.30.0
+python-dotenv>=1.0.0
