@@ -215,6 +215,36 @@ print((d.get('ai_raw_response') or '<未调用模型>')[:1500])
 "
 ```
 
+### 5.4 GitHub Actions（定时抓取 + AI 分析）
+
+`.github/workflows/fetch_kline.yml` 每次运行会：
+
+1. `python fetch_data.py` 抓取行情 CSV（与原行为一致，输出 `kline_data/`）；
+2. 对同一批标的执行 `python main.py analyze`，生成报告到 `reports/`；
+3. 把 Markdown 报告写入 **Actions 运行摘要**（页面上一眼可见结论）；
+4. 上传两个 artifact：`all-kline-data`（7 天）与 `analysis-reports`（30 天）。
+
+**触发方式**：每周一至周五 UTC 21:30 定时执行；也可在 Actions 页面手动触发，并可指定
+`tickers`（留空则使用项目默认列表）、`period`，以及是否执行 `run_analysis`。
+
+**需要的仓库配置**（`Settings → Secrets and variables → Actions`）：
+
+| 类型 | 名称 | 是否必需 | 说明 |
+| --- | --- | --- | --- |
+| Secret | `AI_API_KEY` | 需要 AI 分析时必需 | 未配置则**自动跳过**分析步骤，行情抓取照常运行，不会报错 |
+| Variable | `AI_BASE_URL` | 可选 | 例如 `https://api.deepseek.com`；默认 `https://api.openai.com/v1` |
+| Variable | `AI_MODEL` | 可选 | 例如 `deepseek-chat`；默认 `gpt-4o-mini` |
+
+> ⚠️ 若使用非 OpenAI 服务商，**务必同时设置 `AI_BASE_URL`**，否则会用默认的 OpenAI 地址去调
+> 你服务商的密钥，导致鉴权失败。
+
+**退出码在 CI 中的处理**：`0` 正常；`3`（AI 未生成但报告已保存）记为 warning，不影响任务成功；
+`2`（行情失败/数据不足）记为 error 并让任务失败；单个标的失败不会中断其余标的。
+
+**已知注意点**：定时任务 UTC 21:30 在夏令时对应纽约 17:30（已收盘），但在冬令时是 16:30，
+刚好压在“收盘 + 30 分钟结算缓冲”的边界上，届时当日 K 线可能被判为进行中而排除
+（结果是一天前的数据，不会算错）。若希望全年都有稳定余量，可把 cron 改为 `0 22 * * 1-5`。
+
 ---
 
 ## 6. 计算口径说明

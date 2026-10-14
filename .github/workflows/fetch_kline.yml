@@ -5,12 +5,12 @@ on:
   workflow_dispatch:
     inputs:
       tickers:
-        description: '标的代码（多个用英文逗号隔开）'
+        description: '标的代码（多个用英文逗号隔开，留空则使用默认列表）'
         required: false
-        default: 'GC=F,MU,NVDA,SOXQ'
+        default: ''
         type: string
       period:
-        description: '数据时间跨度'
+        description: '行情 CSV 的数据时间跨度'
         required: false
         default: '3mo'
         type: choice
@@ -19,14 +19,30 @@ on:
           - '3mo'
           - '6mo'
           - '1y'
+      run_analysis:
+        description: '是否执行 AI 技术分析（需要先配置 AI_API_KEY Secret）'
+        required: false
+        default: true
+        type: boolean
 
   # 定时任务：每周一至周五 UTC 21:30 自动执行（使用默认参数）
   schedule:
     - cron: '30 21 * * 1-5'
 
+# 密钥只来自仓库 Secrets，绝不写入代码或日志。
+# 服务商与模型可用仓库 Variables 覆盖（Settings → Secrets and variables → Actions → Variables）：
+#   AI_BASE_URL  例如 https://api.deepseek.com          默认 https://api.openai.com/v1
+#   AI_MODEL     例如 deepseek-chat                    默认 gpt-4o-mini
+# 放在 job 级 env：这些变量的作用域清晰，且 step 的 if 可以通过 env 上下文读到
+#（`secrets` 上下文不能直接用在 if 里，因此用 env 判断密钥是否存在）。
 jobs:
   run-fetcher:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      AI_API_KEY: ${{ secrets.AI_API_KEY }}
+      AI_BASE_URL: ${{ vars.AI_BASE_URL || 'https://api.openai.com/v1' }}
+      AI_MODEL: ${{ vars.AI_MODEL || 'gpt-4o-mini' }}
 
     steps:
       - name: Checkout Repository
@@ -43,12 +59,82 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 将 GitHub 界面输入的参数传递给 Python 脚本
+      # 将 GitHub 界面输入的参数传递给 Python 脚本（留空时脚本自行使用默认值）
       - name: Execute Fetch Script
         run: |
           python fetch_data.py \
             --tickers "${{ inputs.tickers }}" \
             --period "${{ inputs.period }}"
+
+      # 复用项目自身的默认标的列表，避免在 workflow 里重复维护
+      - name: Resolve ticker list
+        id: resolve-tickers
+        env:
+          INPUT_TICKERS: ${{ inputs.tickers }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_TICKERS// /}" ]; then
+            list="${INPUT_TICKERS}"
+          else
+            list="$(python -c 'import fetch_data; print(",".join(fetch_data.parse_args([])[0]))')"
+          fi
+          echo "list=${list}" >> "${GITHUB_OUTPUT}"
+          echo "本次分析标的：${list}"
+
+      # 注意：`secrets` 上下文不能用在 step 的 if 里，因此改用 env 判断。
+      # 未配置 AI_API_KEY 时该步骤跳过，行情抓取不受影响。
+      - name: AI Technical Analysis
+        if: ${{ env.AI_API_KEY != '' && (github.event_name != 'workflow_dispatch' || inputs.run_analysis) }}
+        env:
+          TICKERS: ${{ steps.resolve-tickers.outputs.list }}
+        run: |
+          set -uo pipefail
+          failed=0
+          IFS=',' read -ra SYMBOLS <<< "${TICKERS}"
+          if [ "${#SYMBOLS[@]}" -eq 0 ]; then
+            echo "::warning::没有解析到任何标的，跳过 AI 分析"
+            exit 0
+          fi
+          for raw in "${SYMBOLS[@]}"; do
+            symbol="$(echo "${raw}" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
+            if [ -z "${symbol}" ]; then
+              continue
+            fi
+            echo "::group::技术分析 ${symbol}"
+            # 单个标的失败不中断其余标的；退出码语义见 README 5.2 节
+            code=0
+            python main.py --log-level INFO analyze --symbol "${symbol}" || code=$?
+            case "${code}" in
+              0) echo "✅ ${symbol} 分析完成" ;;
+              3) echo "::warning::${symbol} 行情与指标正常，但 AI 分析未生成，报告仍已保存，详见日志" ;;
+              2) echo "::error::${symbol} 行情获取失败或数据不足"; failed=$((failed + 1)) ;;
+              *) echo "::error::${symbol} 分析异常退出，退出码 ${code}"; failed=$((failed + 1)) ;;
+            esac
+            echo "::endgroup::"
+          done
+          if [ "${failed}" -gt 0 ]; then
+            echo "::error::${failed} 个标的分析失败"
+            exit 1
+          fi
+
+      # 把 Markdown 报告直接写进 Actions 运行摘要，便于在页面上一眼看到结论
+      - name: Publish analysis reports to job summary
+        if: ${{ hashFiles('reports/**/*.md') != '' }}
+        run: |
+          set -euo pipefail
+          {
+            echo "# 📈 AI 技术分析报告"
+            echo
+            # 用 -print0 + read -d '' 处理路径中的特殊字符
+            while IFS= read -r -d '' file; do
+              echo "## 📄 ${file}"
+              echo
+              cat "${file}"
+              echo
+              echo "---"
+              echo
+            done < <(find reports -name '*.md' -print0)
+          } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Upload CSV Artifacts
         uses: actions/upload-artifact@v4
@@ -56,3 +142,13 @@ jobs:
           name: all-kline-data
           path: kline_data/
           retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload Analysis Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: analysis-reports
+          path: reports/
+          retention-days: 30
+          if-no-files-found: warn
