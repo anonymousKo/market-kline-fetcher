@@ -25,14 +25,15 @@ on:
         default: true
         type: boolean
 
-  # 定时任务：每周一至周五 UTC 21:30 自动执行（使用默认参数）
-  schedule:
-    - cron: '30 21 * * 1-5'
+  # 定时任务已按要求移除。若以后需要恢复定时运行，取消下面两行的注释即可
+  #（建议用 0 22 而不是 30 21：后者在冬令时刚好是纽约 16:30，会压在“收盘 + 30 分钟结算缓冲”边界上）
+  # schedule:
+  #   - cron: '0 22 * * 1-5'
 
 # 密钥只来自仓库 Secrets，绝不写入代码或日志。
 # 服务商与模型可用仓库 Variables 覆盖（Settings → Secrets and variables → Actions → Variables）：
-#   AI_BASE_URL  例如 https://api.deepseek.com          默认 https://api.openai.com/v1
-#   AI_MODEL     例如 deepseek-chat                    默认 gpt-4o-mini
+#   AI_BASE_URL  默认 https://api.deepseek.com（可用变量覆盖，例如换成 https://api.openai.com/v1）
+#   AI_MODEL     默认 deepseek-flash（可用变量覆盖，例如 gpt-4o-mini）
 # 放在 job 级 env：这些变量的作用域清晰，且 step 的 if 可以通过 env 上下文读到
 #（`secrets` 上下文不能直接用在 if 里，因此用 env 判断密钥是否存在）。
 jobs:
@@ -41,8 +42,8 @@ jobs:
     timeout-minutes: 30
     env:
       AI_API_KEY: ${{ secrets.AI_API_KEY }}
-      AI_BASE_URL: ${{ vars.AI_BASE_URL || 'https://api.openai.com/v1' }}
-      AI_MODEL: ${{ vars.AI_MODEL || 'gpt-4o-mini' }}
+      AI_BASE_URL: ${{ vars.AI_BASE_URL || 'https://api.deepseek.com' }}
+      AI_MODEL: ${{ vars.AI_MODEL || 'deepseek-flash' }}
 
     steps:
       - name: Checkout Repository
@@ -83,6 +84,7 @@ jobs:
 
       # 注意：`secrets` 上下文不能用在 step 的 if 里，因此改用 env 判断。
       # 未配置 AI_API_KEY 时该步骤跳过，行情抓取不受影响。
+      #（event_name 判断是为了：若以后加回定时触发，自动运行也会执行分析，不受 run_analysis 开关影响）
       - name: AI Technical Analysis
         if: ${{ env.AI_API_KEY != '' && (github.event_name != 'workflow_dispatch' || inputs.run_analysis) }}
         env:

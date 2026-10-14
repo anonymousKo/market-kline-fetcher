@@ -109,8 +109,8 @@ cp .env.example .env
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `AI_API_KEY` | 空 | 密钥；也支持 `OPENAI_API_KEY` |
-| `AI_BASE_URL` | `https://api.openai.com/v1` | 兼容 OpenAI 协议的服务地址 |
-| `AI_MODEL` | `gpt-4o-mini` | 模型名称 |
+| `AI_BASE_URL` | `https://api.deepseek.com` | 兼容 OpenAI 协议的服务地址 |
+| `AI_MODEL` | `deepseek-flash` | 模型名称 |
 | `AI_TIMEOUT` | `60` | 单次请求超时（秒） |
 | `AI_MAX_RETRIES` | `2` | 额外重试次数（仅对超时/限流/网络错误；0 = 不重试） |
 | `AI_TEMPERATURE` | `0.2` | 采样温度 |
@@ -124,12 +124,18 @@ cp .env.example .env
 | `MARKET_TIMEZONE` | 空（自动） | 留空则按代码推断交易所时区 |
 | `KLINE_DIR` / `REPORTS_DIR` | `kline_data` / `reports` | 输出目录 |
 
-以 DeepSeek 为例：
+默认即为 DeepSeek，填好 `AI_API_KEY` 即可使用。切换其它服务商时改这两项：
+
+| 服务商 | `AI_BASE_URL` | `AI_MODEL` 示例 |
+| --- | --- | --- |
+| **DeepSeek（默认）** | `https://api.deepseek.com` | `deepseek-flash` / `deepseek-chat` |
+| OpenAI | `https://api.openai.com/v1` | `gpt-4o-mini` |
+| Moonshot | `https://api.moonshot.cn/v1` | `moonshot-v1-8k` |
+| 本地 vLLM / Ollama | `http://localhost:8000/v1` | 你部署的模型名 |
 
 ```bash
+# 最简用法：只填密钥（服务商与模型使用上面的默认值）
 AI_API_KEY=sk-xxxx
-AI_BASE_URL=https://api.deepseek.com/v1
-AI_MODEL=deepseek-chat
 ```
 
 ---
@@ -215,7 +221,7 @@ print((d.get('ai_raw_response') or '<未调用模型>')[:1500])
 "
 ```
 
-### 5.4 GitHub Actions（定时抓取 + AI 分析）
+### 5.4 GitHub Actions（手动触发：抓行情 + AI 分析）
 
 `.github/workflows/fetch_kline.yml` 每次运行会：
 
@@ -224,26 +230,50 @@ print((d.get('ai_raw_response') or '<未调用模型>')[:1500])
 3. 把 Markdown 报告写入 **Actions 运行摘要**（页面上一眼可见结论）；
 4. 上传两个 artifact：`all-kline-data`（7 天）与 `analysis-reports`（30 天）。
 
-**触发方式**：每周一至周五 UTC 21:30 定时执行；也可在 Actions 页面手动触发，并可指定
+**触发方式**：**仅手动触发**（`workflow_dispatch`），已按要求去掉定时任务。可在 Actions 页面指定
 `tickers`（留空则使用项目默认列表）、`period`，以及是否执行 `run_analysis`。
 
-**需要的仓库配置**（`Settings → Secrets and variables → Actions`）：
+#### 在 GitHub 上配置 API Key（步骤）
 
-| 类型 | 名称 | 是否必需 | 说明 |
+1. 打开仓库页面 → 顶部导航栏 **Settings**
+2. 左侧栏 → **Secrets and variables** → **Actions**
+3. 切到 **Secrets** 选项卡 → 点 **New repository secret**
+   * **Name**：`AI_API_KEY`（必须完全一致，区分大小写）
+   * **Secret**：粘贴你的密钥（如 `sk-xxxxxxxx`）
+   * 点 **Add secret**
+4. （可选）切到 **Variables** 选项卡 → **New repository variable**，覆盖服务商与模型：
+   * `AI_BASE_URL` = `https://api.deepseek.com`
+   * `AI_MODEL` = `deepseek-flash`
+   不设置这两项也可以：workflow 内置默认值已经是 DeepSeek（见下表），**只配 Secret 就能跑通**
+5. 进入 **Actions** 选项卡 → 左侧选 `Fetch K-Line CSV` → 右侧 **Run workflow**
+   → 分支选 `main` → 确认勾选 `run_analysis` → **Run workflow**
+6. 运行结束后：
+   * 页面顶部 **Summary** 可直接看到中文分析报告
+   * 页面底部 **Artifacts** 可下载 `analysis-reports`（Markdown + JSON）与 `all-kline-data`（CSV）
+
+| 类型 | 名称 | 是否必需 | workflow 内置默认值 |
 | --- | --- | --- | --- |
-| Secret | `AI_API_KEY` | 需要 AI 分析时必需 | 未配置则**自动跳过**分析步骤，行情抓取照常运行，不会报错 |
-| Variable | `AI_BASE_URL` | 可选 | 例如 `https://api.deepseek.com`；默认 `https://api.openai.com/v1` |
-| Variable | `AI_MODEL` | 可选 | 例如 `deepseek-chat`；默认 `gpt-4o-mini` |
+| Secret | `AI_API_KEY` | 需要 AI 分析时必需；未配置则**自动跳过**分析步骤，行情抓取照常运行、不报错 | 无 |
+| Variable | `AI_BASE_URL` | 可选 | `https://api.deepseek.com` |
+| Variable | `AI_MODEL` | 可选 | `deepseek-flash` |
 
-> ⚠️ 若使用非 OpenAI 服务商，**务必同时设置 `AI_BASE_URL`**，否则会用默认的 OpenAI 地址去调
-> 你服务商的密钥，导致鉴权失败。
+> 提示：Secret 一旦保存就无法再查看明文，只能重新设置；日志里也不会打印密钥。
 
 **退出码在 CI 中的处理**：`0` 正常；`3`（AI 未生成但报告已保存）记为 warning，不影响任务成功；
 `2`（行情失败/数据不足）记为 error 并让任务失败；单个标的失败不会中断其余标的。
 
-**已知注意点**：定时任务 UTC 21:30 在夏令时对应纽约 17:30（已收盘），但在冬令时是 16:30，
-刚好压在“收盘 + 30 分钟结算缓冲”的边界上，届时当日 K 线可能被判为进行中而排除
-（结果是一天前的数据，不会算错）。若希望全年都有稳定余量，可把 cron 改为 `0 22 * * 1-5`。
+**已知注意点**：workflow 文件（`.github/workflows/` 下的文件）的推送需要凭据具备 `workflow`
+scope，否则会报错，处理方式见第 9 节。
+
+**想恢复定时运行**：在 workflow 的 `on:` 下加回（已注释掉的示例可直接取消注释）：
+
+```yaml
+  schedule:
+    - cron: '0 22 * * 1-5'   # UTC 22:00 = 纽约 18:00（夏令时）/ 17:00（冬令时）
+```
+
+建议用 `0 22` 而不是 `30 21`：后者在冬令时刚好是纽约 16:30，压在“收盘 + 30 分钟结算缓冲”
+边界上，当日 K 线可能被判为进行中而排除，导致分析滞后一天。
 
 ---
 
@@ -418,6 +448,8 @@ AI_API_KEY=sk-mock AI_BASE_URL=http://127.0.0.1:8765/v1 AI_MODEL=mock-model \
 | 报告中 `MA200 / 6m 收益率 = 数据不足` | 历史长度不足 | 增大 `--period`（默认 2y 通常足够） |
 | 报告显示"最近一周尚未结束，已排除" | 当前交易周未结束 | 正常行为，避免把进行中的周当成已完成周线 |
 | `urllib3 ... NotOpenSSLWarning` | macOS 系统 Python 使用 LibreSSL | 无害警告，可忽略，或改用 Homebrew 安装的 Python |
+| `refusing to allow an OAuth App to create or update workflow ... without workflow scope` | 当前凭据缺少 `workflow` scope，无法推送 `.github/workflows/` 下的改动 | 执行 `gh auth refresh -h github.com -s workflow`，再执行 `gh auth setup-git`（让 git 用 gh 的新凭据而非 Keychain 里的旧 token），然后重新 `git push` |
+| `AI 鉴权失败` 且用的是非 OpenAI 服务商 | `AI_BASE_URL` 与服务商不匹配 | 在 `.env` 或仓库 Variables 里设置正确的 `AI_BASE_URL` |
 
 ---
 
@@ -436,8 +468,7 @@ AI_API_KEY=sk-mock AI_BASE_URL=http://127.0.0.1:8765/v1 AI_MODEL=mock-model \
 **后续可扩展（当前版本未实现）**
 
 * 自动判定"看涨/看跌条件是否触发"（`review` 已计算未来收益与 MFE/MAE，但尚未自动匹配情景条件）。
-* 批量/定时分析（可在 `.github/workflows/fetch_kline.yml` 中增加分析步骤，
-  并把 `AI_API_KEY` 配置为 GitHub Secrets）。
+* 定时分析（workflow 已支持手动触发的抓取 + 分析；把 `schedule` 加回即可恢复定时运行）。
 * 多标的横向对比、行业基准选择、回测框架接入。
 * 更丰富的输出形式（HTML / 邮件 / 消息推送）。
 
