@@ -142,8 +142,12 @@ class Settings:
     # 输出目录
     kline_dir: str = "kline_data"
     reports_dir: str = "reports"
-    # 数据时区（仅用于记录与展示；日线数据本身按交易所本地日期存储）
-    timezone: str = "America/New_York"
+    # 交易所时区；``None`` 表示按代码自动推断（推荐）
+    timezone: Optional[str] = None
+    # 处理“盘中未完成 K 线”的策略：drop=排除（默认）/ keep=保留但标注
+    intraday_policy: str = "drop"
+    # 交易所收盘时间（本地时间 HH:MM），用于判断当日是否已收盘
+    market_close_time: str = "16:00"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -158,6 +162,9 @@ class Settings:
             json_mode=_get_bool("AI_JSON_MODE", True),
             retry_backoff=_get_float("AI_RETRY_BACKOFF", 2.0),
         )
+        policy = (_get_str("INTRADAY_POLICY", "drop") or "drop").strip().lower()
+        if policy not in {"drop", "keep", "auto"}:
+            policy = "drop"
         return cls(
             ai=ai,
             analysis_period=_get_str("ANALYSIS_PERIOD", "2y") or "2y",
@@ -165,7 +172,9 @@ class Settings:
             benchmarks=_get_list("BENCHMARKS", ["SPY", "QQQ"]),
             kline_dir=_get_str("KLINE_DIR", "kline_data") or "kline_data",
             reports_dir=_get_str("REPORTS_DIR", "reports") or "reports",
-            timezone=_get_str("MARKET_TIMEZONE", "America/New_York") or "America/New_York",
+            timezone=_get_str("MARKET_TIMEZONE"),  # 未设置时为 None -> 自动推断
+            intraday_policy=policy,
+            market_close_time=_get_str("MARKET_CLOSE_TIME", "16:00") or "16:00",
         )
 
 

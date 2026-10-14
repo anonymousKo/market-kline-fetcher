@@ -47,6 +47,99 @@ _COLUMN_ALIASES = {
 # 默认复权口径说明（用于报告与记录）
 ADJUSTMENT_NOTE = "auto_adjust=True（yfinance 后复权调整后的 OHLC，含分红/拆股调整）"
 
+# 各市场的交易所时区（用于判断“当日交易是否已经收盘”）
+_MARKET_TIMEZONES: Dict[str, str] = {
+    "us_equity": "America/New_York",
+    "us_etf": "America/New_York",
+    "index": "America/New_York",
+    "futures": "America/New_York",
+    "forex": "UTC",
+    "china_a_shanghai": "Asia/Shanghai",
+    "china_a_shenzhen": "Asia/Shanghai",
+    "hong_kong": "Asia/Hong_Kong",
+    "japan": "Asia/Tokyo",
+    "uk": "Europe/London",
+    "canada": "America/Toronto",
+    "unknown": "UTC",
+}
+
+# 收盘后等待多少分钟才认为当日数据已经结算完毕（数据源仍可能返回盘中值）
+DEFAULT_SETTLE_MINUTES = 30
+
+
+def infer_timezone(symbol: str) -> str:
+    """根据代码推断**交易所所在时区**，用于判断当日交易是否已收盘。
+
+    无法识别时返回 ``UTC``，不会猜测成具体市场。
+    """
+    market, _currency = infer_market(symbol)
+    return _MARKET_TIMEZONES.get(market, "UTC")
+
+
+def market_now(timezone_name: str) -> pd.Timestamp:
+    """返回指定时区的当前时间（时区感知）。时区名非法时退化为 ``UTC``。"""
+    try:
+        return pd.Timestamp.now(tz=timezone_name)
+    except Exception:  # pragma: no cover - 非法时区名兜底
+        logger.warning("无法识别的时区 %r，已退化为 UTC", timezone_name)
+        return pd.Timestamp.now(tz="UTC")
+
+
+def session_in_progress(
+    last_bar_date: pd.Timestamp,
+    timezone_name: str,
+    close_time: str = "16:00",
+    settle_minutes: int = DEFAULT_SETTLE_MINUTES,
+    now: Optional[pd.Timestamp] = None,
+) -> Tuple[bool, Optional[str]]:
+    """判断最后一根日 K 线是否属于**尚未结束**的交易日。
+
+    返回 ``(是否未结束, 原因说明)``。判定逻辑（全部基于**交易所本地时间**，
+    而不是运行脚本的机器时区）：
+
+    1. 若最后一根 K 线的日期早于交易所当地今天 -> 已收盘，返回 ``(False, None)``；
+    2. 若等于当地今天，且当地现在时间早于收盘时间 -> 未结束；
+    3. 若处于收盘时间后 ``settle_minutes`` 分钟内 -> 数据源可能仍在结算，保守视为未结束；
+    4. 否则视为已收盘（周末同理）。
+
+    ``now`` 可注入，便于测试与“指定分析时间”的场景。
+    """
+    reference = now if now is not None else market_now(timezone_name)
+    if reference.tzinfo is None:  # 允许传入 naive 时间（按市场时区解释）
+        reference = reference.tz_localize(timezone_name)
+
+    local = reference.tz_convert(timezone_name)
+    local_date = local.normalize().tz_localize(None)
+    bar_date = pd.Timestamp(last_bar_date).normalize()
+
+    if bar_date < local_date:
+        return False, None
+    if bar_date > local_date:
+        # 数据日期晚于当地今天，属于异常数据，不做“盘中”判断
+        return False, None
+    if local.weekday() >= 5:
+        return False, None
+
+    try:
+        hour, minute = (int(part) for part in str(close_time).split(":", 1))
+    except (ValueError, TypeError):
+        hour, minute = 16, 0
+    close_ts = local.normalize() + pd.Timedelta(hours=hour, minutes=minute)
+
+    if local < close_ts:
+        return True, (
+            "当日交易尚未收盘（交易所当地时间 {}，收盘时间 {}）".format(
+                local.strftime("%Y-%m-%d %H:%M"), close_ts.strftime("%H:%M")
+            )
+        )
+    if local < close_ts + pd.Timedelta(minutes=max(0, settle_minutes)):
+        return True, (
+            "刚过收盘时间（交易所当地时间 {}），当日行情可能仍在结算".format(
+                local.strftime("%Y-%m-%d %H:%M")
+            )
+        )
+    return False, None
+
 
 # ---------------------------------------------------------------------------
 # 市场识别
@@ -269,10 +362,19 @@ class DataQuality:
     warnings: List[str] = field(default_factory=list)  # 非阻塞提示
     adjusted: bool = True
     adjustment_note: str = ADJUSTMENT_NOTE
-    timezone: str = ""
+    timezone: str = ""  # 交易所时区
     fetched_at_utc: str = ""
+    # 数据源最新一根 K 线的日期（可能是盘中那根）
+    source_last_bar_date: Optional[str] = None
+    # 分析实际使用数据的最后一根 K 线日期
     last_bar_date: Optional[str] = None
+    # 数据源最后一根 K 线是否属于“进行中的交易日”
+    source_last_bar_incomplete: bool = False
+    # 是否把该盘中 K 线排除出了指标计算
+    intraday_excluded: bool = False
+    # 分析所用数据的最后一根 K 线是否未完成（排除后为 False）
     incomplete_bar: bool = False
+    incomplete_reason: Optional[str] = None
 
     @property
     def ok(self) -> bool:
@@ -290,8 +392,12 @@ class DataQuality:
             "adjustment_note": self.adjustment_note,
             "timezone": self.timezone,
             "fetched_at_utc": self.fetched_at_utc,
+            "source_last_bar_date": self.source_last_bar_date,
             "last_bar_date": self.last_bar_date,
+            "source_last_bar_incomplete": self.source_last_bar_incomplete,
+            "intraday_excluded": self.intraday_excluded,
             "incomplete_bar": self.incomplete_bar,
+            "incomplete_reason": self.incomplete_reason,
             "ok": self.ok,
         }
 
@@ -306,6 +412,30 @@ class DataQuality:
         return lines
 
 
+def _reference_time(timezone_name: str, as_of: Optional[pd.Timestamp]) -> pd.Timestamp:
+    """把参考时间规整为带时区的时间点（用于新鲜度与盘中判断）。
+
+    * 未提供 ``as_of``：交易所当地时间的“现在”；
+    * 只给了日期（如 ``--as-of 2026-10-09``）：视为该日**已收盘**（23:59），
+      保证结果可复现，不会因为跑脚本的时刻不同而变化；
+    * 给了具体时间：直接使用。
+    """
+    if as_of is None:
+        return market_now(timezone_name)
+
+    ts = pd.Timestamp(as_of)
+    if ts.tzinfo is None:
+        if ts.normalize() == ts:  # 只有日期，没有时间
+            ts = ts + pd.Timedelta(hours=23, minutes=59)
+        ts = ts.tz_localize(timezone_name)
+    return ts
+
+
+def _local_date(timezone_name: str, as_of: Optional[pd.Timestamp]) -> pd.Timestamp:
+    """把参考时间换算成**交易所当地的日期**（naive，仅日期）。"""
+    return _reference_time(timezone_name, as_of).tz_convert(timezone_name).normalize().tz_localize(None)
+
+
 def check_quality(
     df: pd.DataFrame,
     symbol: str,
@@ -314,8 +444,14 @@ def check_quality(
     stale_days: int = 10,
     as_of: Optional[pd.Timestamp] = None,
     extra_notes: Optional[Sequence[str]] = None,
+    close_time: str = "16:00",
+    settle_minutes: int = DEFAULT_SETTLE_MINUTES,
 ) -> DataQuality:
-    """对已清洗的行情做质量检查（只读，不修改数据）。"""
+    """对已清洗的行情做质量检查（只读，不修改数据）。
+
+    参考时间（``as_of``）与“是否盘中”的判断全部基于**交易所当地时区**，
+    而不是运行脚本的机器时区。
+    """
     quality = DataQuality(symbol=symbol)
     quality.timezone = timezone_name
     quality.fetched_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -331,6 +467,7 @@ def check_quality(
     quality.bars = int(len(df))
     quality.start_date = pd.Timestamp(df["Date"].iloc[0]).strftime("%Y-%m-%d")
     quality.end_date = pd.Timestamp(df["Date"].iloc[-1]).strftime("%Y-%m-%d")
+    quality.source_last_bar_date = quality.end_date
     quality.last_bar_date = quality.end_date
 
     # 日期单调性 / 重复（normalize 已处理，这里作为最终断言）
@@ -370,23 +507,103 @@ def check_quality(
             f"MA200 / 6 个月收益率等指标可能不可用"
         )
 
-    # 数据新鲜度
-    reference = as_of if as_of is not None else pd.Timestamp.now().normalize()
+    # 数据新鲜度（相对交易所当地今天）
+    reference = _reference_time(timezone_name, as_of)
+    local_today = _local_date(timezone_name, as_of)
     last_date = pd.Timestamp(df["Date"].iloc[-1]).normalize()
-    gap_days = int((reference.normalize() - last_date).days)
+    gap_days = int((local_today - last_date).days)
     if gap_days > stale_days:
         quality.warnings.append(
-            f"最后一根 K 线为 {quality.end_date}，距参考日期已 {gap_days} 天，数据可能不新鲜"
+            f"最后一根 K 线为 {quality.end_date}，距交易所当地日期已 {gap_days} 天，数据可能不新鲜"
+        )
+    elif gap_days < 0:
+        quality.warnings.append(
+            f"最后一根 K 线（{quality.end_date}）晚于交易所当地日期（{local_today.strftime('%Y-%m-%d')}），请留意数据源"
         )
 
-    # 当日是否可能尚未收盘
-    if gap_days == 0:
-        quality.incomplete_bar = True
+    # 最后一根 K 线是否属于“进行中的交易日”
+    in_progress, reason = session_in_progress(
+        last_date,
+        timezone_name,
+        close_time=close_time,
+        settle_minutes=settle_minutes,
+        now=reference,
+    )
+    quality.source_last_bar_incomplete = in_progress
+    quality.incomplete_bar = in_progress  # 未排除前，分析数据本身就带着这根未完成的 K 线
+    quality.incomplete_reason = reason
+    if in_progress:
         quality.warnings.append(
-            "最后一根 K 线日期为参考日期当天，该交易日可能尚未收盘（当日数据可能不完整）"
+            "最后一根 K 线（{}）属于进行中的交易日：{}。"
+            "该 K 线的收盘价实为盘中最新价、成交量为盘中累计值，直接用于指标会失真。".format(
+                quality.end_date, reason
+            )
         )
 
     return quality
+
+
+def split_incomplete_bar(
+    daily: pd.DataFrame, quality: DataQuality
+) -> Tuple[pd.DataFrame, Optional[Dict[str, object]]]:
+    """若最后一根 K 线属于**进行中的交易日**，把它从分析数据中拆出来。
+
+    返回 ``(用于计算的日线, 盘中快照或 None)``。
+
+    盘中快照中的 ``last`` 是盘中最新价、``volume`` 是盘中累计成交量，二者都
+    **不参与**任何指标计算；拆出后 ``quality`` 描述的是“实际用于分析的数据”。
+    """
+    if daily is None or daily.empty or not quality.source_last_bar_incomplete:
+        return daily, None
+
+    if len(daily) < 2:
+        # 只剩这一根时无法拆分（没有上一根收盘价作对比），保持原样并保留警告
+        return daily, None
+
+    row = daily.iloc[-1]
+    prev_close = float(daily["Close"].iloc[-2])
+    last_price = float(row["Close"])
+    volume = row.get("Volume")
+
+    snapshot: Dict[str, object] = {
+        "date": pd.Timestamp(row["Date"]).strftime("%Y-%m-%d"),
+        "open": _safe_float(row.get("Open")),
+        "high": _safe_float(row.get("High")),
+        "low": _safe_float(row.get("Low")),
+        "last": _safe_float(last_price),
+        "volume": _safe_float(volume),
+        "prev_close": _safe_float(prev_close),
+        "change_pct_vs_prev_close": (
+            None if prev_close in (0, None) else round((last_price / prev_close - 1.0) * 100.0, 2)
+        ),
+        "reason": quality.incomplete_reason,
+        "note": "盘中数据：最新价为盘中现价，成交量为盘中累计值，未参与任何指标计算",
+    }
+
+    closed = daily.iloc[:-1].reset_index(drop=True)
+    closed.attrs["notes"] = list(daily.attrs.get("notes", []))
+
+    quality.intraday_excluded = True
+    quality.incomplete_bar = False  # 分析实际使用的数据里已无未完成 K 线
+    quality.bars = int(len(closed))
+    quality.end_date = pd.Timestamp(closed["Date"].iloc[-1]).strftime("%Y-%m-%d")
+    quality.last_bar_date = quality.end_date
+    quality.warnings.append(
+        "已把进行中的交易日 {}（盘中）排除出指标计算，分析数据截止 {}".format(
+            snapshot["date"], quality.end_date
+        )
+    )
+    return closed, snapshot
+
+
+def _safe_float(value: object) -> Optional[float]:
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if np.isnan(number) or np.isinf(number):
+        return None
+    return round(number, 4)
 
 
 # ---------------------------------------------------------------------------
@@ -440,10 +657,15 @@ def prepare_daily(
     raw: pd.DataFrame,
     symbol: str,
     min_bars: int = 260,
-    timezone_name: str = "America/New_York",
+    timezone_name: Optional[str] = None,
     as_of: Optional[pd.Timestamp] = None,
+    close_time: str = "16:00",
 ) -> Tuple[pd.DataFrame, DataQuality]:
-    """规范化 + 清洗 + 质量检查，返回 ``(daily_df, quality)``。"""
+    """规范化 + 清洗 + 质量检查，返回 ``(daily_df, quality)``。
+
+    ``timezone_name`` 缺省时根据代码自动推断交易所时区（见 :func:`infer_timezone`）。
+    """
+    timezone_name = timezone_name or infer_timezone(symbol)
     df = normalize_ohlcv(raw, symbol)
     df, clean_notes = drop_invalid_rows(df)
     quality = check_quality(
@@ -453,6 +675,7 @@ def prepare_daily(
         timezone_name=timezone_name,
         as_of=as_of,
         extra_notes=clean_notes,
+        close_time=close_time,
     )
     return df, quality
 
@@ -461,7 +684,7 @@ def fetch_daily(
     symbol: str,
     period: str = "2y",
     min_bars: int = 260,
-    timezone_name: str = "America/New_York",
+    timezone_name: Optional[str] = None,
     as_of: Optional[pd.Timestamp] = None,
     start: Optional[str] = None,
     end: Optional[str] = None,
@@ -582,7 +805,7 @@ def aggregate_weekly(
         return weekly, False, ["周线聚合结果为空"]
 
     last_week_end = pd.Timestamp(weekly["WeekEnd"].iloc[-1])
-    reference = pd.Timestamp(as_of).normalize() if as_of is not None else pd.Timestamp.now().normalize()
+    reference = _local_date(timezone_name, as_of)
     last_week_complete = is_week_complete(last_week_end, reference)
 
     if weekly["Bars"].iloc[-1] < 5:

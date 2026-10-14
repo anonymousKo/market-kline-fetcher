@@ -125,6 +125,10 @@ USER_INSTRUCTION = """请基于以下由程序计算的结构化数据，按要�
 * `key_levels.insufficient_evidence` 为 true 时，说明关键价位证据不足，必须如实说明。
 * `relative_strength.available` 为 false 时，必须明确写出无法判断相对强弱。
 * 指标值为 null 表示该指标不可用，必须说明其影响。
+* 若 `price.intraday` 不为 null，说明数据源最新一根 K 线属于**进行中的交易日**，已被排除出计算：
+  其中的 `last` 是盘中最新价、`volume` 是盘中累计成交量，**不完整**，
+  不得当作收盘价或全日成交量；`price.close` 与全部指标均基于最后已收盘交易日。
+  分析时可把盘中价作为“当前参考”，但必须明确标注其为盘中值，并说明指标口径截止到哪个交易日。
 
 结构化数据：
 """

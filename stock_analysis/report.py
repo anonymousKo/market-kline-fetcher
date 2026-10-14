@@ -56,7 +56,7 @@ def _bullets(items: Optional[List[Any]], empty: str = "无", indent: int = 0) ->
     return "\n".join(lines)
 
 
-def _indicator_table(indicators: Dict[str, Any]) -> str:
+def _indicator_table(indicators: Dict[str, Any], intraday: Optional[Dict[str, Any]] = None) -> str:
     ma = indicators.get("ma", {}) or {}
     vs = indicators.get("price_vs_ma_pct", {}) or {}
     rsi = indicators.get("rsi", {}) or {}
@@ -65,7 +65,7 @@ def _indicator_table(indicators: Dict[str, Any]) -> str:
     volume = indicators.get("volume", {}) or {}
 
     rows = [
-        ("收盘价", _fmt(indicators.get("close"))),
+        ("收盘价（最后已收盘）", _fmt(indicators.get("close"))),
         ("MA20", _fmt(ma.get("ma20"))),
         ("MA50", _fmt(ma.get("ma50"))),
         ("MA200", _fmt(ma.get("ma200"))),
@@ -84,6 +84,19 @@ def _indicator_table(indicators: Dict[str, Any]) -> str:
         ("20 日均量", _fmt(volume.get("volume_avg20"), 0)),
         ("量比（今量/20 日均量）", _fmt(volume.get("volume_ratio20"), 2, "x")),
     ]
+
+    if intraday:
+        # 盘中值单独列出并明确标注“未参与计算”，避免与已收盘口径混淆
+        rows.insert(1, ("盘中最新价（未参与指标计算）", _fmt(intraday.get("last"))))
+        rows.insert(
+            2,
+            (
+                "盘中涨跌（相对上一收盘，未参与计算）",
+                _fmt(intraday.get("change_pct_vs_prev_close"), 2, "%"),
+            ),
+        )
+        rows.insert(3, ("盘中累计成交量（未参与计算）", _fmt(intraday.get("volume"), 0)))
+
     lines = ["| 指标 | 数值 |", "| --- | --- |"]
     lines.extend(f"| {name} | {value} |" for name, value in rows)
 
@@ -292,11 +305,23 @@ def render_markdown(record: Dict[str, Any]) -> str:
     rs = record.get("relative_strength", {}) or {}
 
     symbol = record.get("symbol", "-")
+    intraday = record.get("intraday") or None
     lines: List[str] = []
     lines.append(f"# {symbol} 技术分析报告")
     lines.append("")
     lines.append(f"- **分析日期**：{record.get('analysis_date', '-')}")
     lines.append(f"- **数据截止**：{quality.get('last_bar_date') or '-'}（时区：{meta.get('timezone') or '-'}）")
+    if intraday:
+        lines.append(
+            "- **盘中数据**：{} 最新价 {}（较上一收盘 {}）；当日成交量为盘中累计值，"
+            "**已排除出指标计算**".format(
+                intraday.get("date"),
+                _fmt(intraday.get("last")),
+                _fmt(intraday.get("change_pct_vs_prev_close"), 2, "%"),
+            )
+        )
+        if intraday.get("reason"):
+            lines.append(f"  - 判定依据：{intraday['reason']}")
     lines.append(f"- **市场 / 币种**：{record.get('market', '-')} / {record.get('currency', '-')}")
     lines.append(f"- **复权口径**：{quality.get('adjustment_note') or '-'}")
     lines.append(f"- **分析模型**：{record.get('model') or '未调用（未配置 API 密钥）'}")
@@ -318,6 +343,13 @@ def render_markdown(record: Dict[str, Any]) -> str:
     if not issues and not warnings:
         lines.append("- 数据质量检查未发现异常。")
     lines.append(f"- 日线 K 线数量：{quality.get('bars', '-')}，区间：{quality.get('start_date', '-')} ~ {quality.get('end_date', '-')}")
+    if intraday:
+        lines.append(
+            "- ⚠️ 数据源最新一根 K 线 {}（{}）属于进行中的交易日，"
+            "其收盘价与成交量为盘中值，已排除出全部分析计算。".format(
+                intraday.get("date"), quality.get("incomplete_reason") or "未收盘"
+            )
+        )
     indicator_warnings = ((record.get("context") or {}).get("data_quality") or {}).get("indicator_warnings") or []
     if indicator_warnings:
         lines.append("")
@@ -325,7 +357,7 @@ def render_markdown(record: Dict[str, Any]) -> str:
         lines.extend(f"- ⚠️ {item}" for item in indicator_warnings)
 
     lines.append("\n## 指标摘要（程序计算）\n")
-    lines.append(_indicator_table(indicators))
+    lines.append(_indicator_table(indicators, intraday))
 
     lines.append("\n## 周线趋势摘要（程序计算）\n")
     lines.append(_weekly_block(weekly))

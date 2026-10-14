@@ -102,9 +102,36 @@ def test_check_quality_stale_and_incomplete_bar(sample_daily):
     )
     assert any("不新鲜" in w for w in stale.warnings)
 
-    same_day = kline.check_quality(sample_daily, "TEST", min_bars=100, as_of=last_date)
-    assert same_day.incomplete_bar is True
-    assert any("尚未收盘" in w for w in same_day.warnings)
+    # 盘中：参考时间带具体时刻，且早于交易所收盘时间
+    mid_session = kline.check_quality(
+        sample_daily,
+        "TEST",
+        min_bars=100,
+        as_of=last_date + pd.Timedelta(hours=12, minutes=30),
+        timezone_name="America/New_York",
+    )
+    assert mid_session.incomplete_bar is True
+    assert mid_session.source_last_bar_incomplete is True
+    assert any("尚未收盘" in w for w in mid_session.warnings)
+
+    # 盘后：同一日期，但已过收盘 + 结算缓冲时间 -> 不再标记为盘中
+    after_close = kline.check_quality(
+        sample_daily,
+        "TEST",
+        min_bars=100,
+        as_of=last_date + pd.Timedelta(hours=17),
+        timezone_name="America/New_York",
+    )
+    assert after_close.incomplete_bar is False
+    assert after_close.source_last_bar_incomplete is False
+
+
+def test_check_quality_as_of_date_only_treated_as_closed(sample_daily):
+    """--as-of 只给日期时，视为该日已收盘，保证结果可复现。"""
+    last_date = pd.Timestamp(sample_daily["Date"].iloc[-1])
+    quality = kline.check_quality(sample_daily, "TEST", min_bars=100, as_of=last_date)
+    assert quality.incomplete_bar is False
+    assert quality.source_last_bar_incomplete is False
 
 
 def test_check_quality_empty():

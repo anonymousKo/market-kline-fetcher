@@ -96,9 +96,18 @@ def load_daily_data(
     period: Optional[str] = None,
     as_of: Optional[pd.Timestamp] = None,
     csv_path: Optional[str] = None,
-) -> Tuple[pd.DataFrame, kline.DataQuality]:
-    """获取并检查日线数据（不使用 AI）。"""
+    timezone_name: Optional[str] = None,
+    intraday_policy: Optional[str] = None,
+    now: Optional[pd.Timestamp] = None,
+) -> Tuple[pd.DataFrame, kline.DataQuality, Optional[Dict[str, Any]]]:
+    """获取并检查日线数据（不使用 AI）。
+
+    返回 ``(用于计算的日线, 数据质量, 盘中快照或 None)``。
+    """
     period = period or settings.analysis_period
+    timezone_name = timezone_name or settings.timezone or kline.infer_timezone(symbol)
+    policy = (intraday_policy or settings.intraday_policy or "drop").strip().lower()
+    reference = as_of if as_of is not None else now
 
     if csv_path:
         logger.info("从本地文件读取行情：%s", csv_path)
@@ -119,8 +128,9 @@ def load_daily_data(
         raw,
         symbol,
         min_bars=settings.min_daily_bars,
-        timezone_name=settings.timezone,
-        as_of=as_of,
+        timezone_name=timezone_name,
+        as_of=reference,
+        close_time=settings.market_close_time,
     )
 
     if daily is None or daily.empty:
@@ -128,11 +138,38 @@ def load_daily_data(
             f"{symbol} 未获取到有效行情数据。请检查代码是否正确（yfinance 格式，如 MSFT / 000001.SZ / GC=F），"
             "或稍后重试。"
         )
+
+    # ---- 处理“盘中未完成 K 线” ----
+    intraday: Optional[Dict[str, Any]] = None
+    if quality.source_last_bar_incomplete:
+        if policy == "keep":
+            quality.warnings.append(
+                "已按 INTRADAY_POLICY=keep 保留盘中未完成 K 线（{}）："
+                "其收盘价与成交量为盘中值，MA/RSI/MACD/量比/收益率等指标均可能失真，请谨慎解读".format(
+                    quality.source_last_bar_date
+                )
+            )
+            logger.warning(
+                "%s 最后一根 K 线为盘中数据且已按要求保留，指标可能失真（policy=keep）", symbol
+            )
+        else:
+            daily, intraday = kline.split_incomplete_bar(daily, quality)
+            if intraday is not None:
+                logger.info(
+                    "%s 检测到盘中未完成 K 线（%s，最新价 %s），已排除出指标计算；"
+                    "分析数据截止 %s",
+                    symbol,
+                    intraday.get("date"),
+                    intraday.get("last"),
+                    quality.last_bar_date,
+                )
+
     if len(daily) < MIN_REQUIRED_BARS:
         raise AnalysisError(
-            f"{symbol} 历史数据不足：仅 {len(daily)} 根日 K，至少需要 {MIN_REQUIRED_BARS} 根才能进行技术分析。"
+            f"{symbol} 历史数据不足：排除盘中数据后仅 {len(daily)} 根日 K，"
+            f"至少需要 {MIN_REQUIRED_BARS} 根才能进行技术分析。"
         )
-    return daily, quality
+    return daily, quality, intraday
 
 
 def build_benchmarks(
@@ -141,7 +178,10 @@ def build_benchmarks(
     period: Optional[str] = None,
     as_of: Optional[pd.Timestamp] = None,
 ) -> Dict[str, pd.DataFrame]:
-    """抓取基准行情；单个基准失败不影响整体流程。"""
+    """抓取基准行情；单个基准失败不影响整体流程。
+
+    基准只用于对齐窗口的收益率对比，因此**不**做盘中排除（保持与个股窗口一致即可）。
+    """
     frames: Dict[str, pd.DataFrame] = {}
     for bench in benchmark_symbols:
         try:
@@ -156,6 +196,13 @@ def build_benchmarks(
             if bench_df.empty:
                 logger.warning("基准 %s 未获取到数据，已跳过", bench)
                 continue
+            if bench_quality.source_last_bar_incomplete:
+                # 基准也受盘中影响：统一按同一策略处理，保证两边窗口一致
+                bench_df, _snapshot = kline.split_incomplete_bar(bench_df, bench_quality)
+                if bench_df.empty:
+                    logger.warning("基准 %s 排除盘中数据后为空，已跳过", bench)
+                    continue
+                logger.info("基准 %s 同样排除了盘中未完成 K 线", bench)
             for issue in bench_quality.issues:
                 logger.warning("基准 %s 数据问题：%s", bench, issue)
             frames[bench] = bench_df
@@ -179,16 +226,25 @@ def run_analysis(
     benchmarks: Optional[List[str]] = None,
     save: bool = True,
     client: Optional[LLMClient] = None,
+    intraday_policy: Optional[str] = None,
+    now: Optional[pd.Timestamp] = None,
 ) -> AnalysisResult:
     """对单个标的执行完整分析流程。
 
     AI 失败不会抛出异常：会在结果中记录 ``ai_error`` 并生成不含 AI 部分的报告。
     行情获取失败或数据严重不足时抛出 :class:`AnalysisError`。
+
+    ``intraday_policy``：``drop``（默认，排除进行中的交易日）/ ``keep``（保留但标注）。
+    ``now``：可注入的“当前时间”（交易所时区或带时区），便于测试与重现。
     """
     settings = settings or Settings.from_env()
     symbol = symbol.strip().upper()
     if not symbol:
         raise AnalysisError("股票代码不能为空")
+
+    timezone_name = settings.timezone or kline.infer_timezone(symbol)
+    policy = (intraday_policy or settings.intraday_policy or "drop").strip().lower()
+    reference = as_of if as_of is not None else now
 
     analysis_date = (
         pd.Timestamp(as_of).normalize().strftime("%Y-%m-%d")
@@ -196,15 +252,22 @@ def run_analysis(
         else None
     )
 
-    daily, quality = load_daily_data(
-        symbol, settings, period=period, as_of=as_of, csv_path=csv_path
+    daily, quality, intraday = load_daily_data(
+        symbol,
+        settings,
+        period=period,
+        as_of=as_of,
+        csv_path=csv_path,
+        timezone_name=timezone_name,
+        intraday_policy=policy,
+        now=now,
     )
     if analysis_date is None:
         analysis_date = quality.last_bar_date or datetime.now().strftime("%Y-%m-%d")
 
     # ---- 周线聚合（自动剔除进行中的交易周） ----
     weekly, last_week_complete, weekly_warnings = kline.aggregate_weekly(
-        daily, as_of=as_of, drop_incomplete=True, timezone_name=settings.timezone
+        daily, as_of=reference, drop_incomplete=True, timezone_name=timezone_name
     )
     for warning in weekly_warnings:
         logger.info("周线聚合：%s", warning)
@@ -216,7 +279,7 @@ def run_analysis(
 
     # ---- 相对强弱 ----
     benchmark_symbols = benchmarks if benchmarks is not None else list(settings.benchmarks)
-    benchmark_frames = build_benchmarks(benchmark_symbols, settings, period=period, as_of=as_of)
+    benchmark_frames = build_benchmarks(benchmark_symbols, settings, period=period, as_of=reference)
     relative = context_builder.build_relative_strength(daily, benchmark_frames)
 
     # ---- 组装给模型的上下文 ----
@@ -233,9 +296,10 @@ def run_analysis(
         key_levels=levels,
         quality=quality.to_dict(),
         relative_strength=relative,
+        intraday=intraday,
         prompt_version=PROMPT_VERSION,
         adjustment_note=kline.ADJUSTMENT_NOTE,
-        timezone_name=settings.timezone,
+        timezone_name=timezone_name,
     )
 
     # ---- AI 分析（失败不影响主流程） ----
@@ -300,6 +364,7 @@ def run_analysis(
         "weekly_summary": weekly_snapshot,
         "key_levels": levels,
         "relative_strength": relative,
+        "intraday": intraday,
         "ai_result": ai_result,
         "ai_warnings": ai_warnings,
         "ai_meta": {k: v for k, v in ai_meta.items() if k != "raw_response"},
@@ -308,7 +373,9 @@ def run_analysis(
         "context": model_context,
         "meta": {
             "generated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "timezone": settings.timezone,
+            "timezone": timezone_name,
+            "intraday_policy": policy,
+            "source_last_bar_date": quality.source_last_bar_date,
             "weekly_last_week_complete": last_week_complete,
             "weekly_warnings": weekly_warnings,
             "benchmarks": benchmark_symbols,

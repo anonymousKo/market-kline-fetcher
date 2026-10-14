@@ -97,6 +97,12 @@ def _add_analysis_args(parser: argparse.ArgumentParser, include_period: bool = T
 
     parser.add_argument("--csv", dest="csv_path", default="", help="改用本地 CSV 行情文件，不联网取数")
     parser.add_argument("--no-ai", action="store_true", help="跳过 AI 分析，只计算行情与技术指标")
+    parser.add_argument(
+        "--intraday",
+        choices=["drop", "keep"],
+        default="",
+        help="盘中未完成 K 线的处理：drop=排除出指标计算（默认）| keep=保留但明确标注",
+    )
     parser.add_argument("--no-benchmark", action="store_true", help="不获取 SPY/QQQ 等基准行情")
     parser.add_argument("--benchmarks", default="", help="自定义基准，英文逗号分隔，如 SPY,QQQ")
     parser.add_argument("--reports-dir", default="", help="报告输出目录，默认 reports")
@@ -167,6 +173,7 @@ def _run_analysis(args: argparse.Namespace) -> int:
             csv_path=getattr(args, "csv_path", "") or None,
             use_ai=not getattr(args, "no_ai", False),
             save=not getattr(args, "no_save", False),
+            intraday_policy=getattr(args, "intraday", "") or None,
         )
     except pipeline.AnalysisError as exc:
         logger.error("%s", exc)

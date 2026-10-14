@@ -94,17 +94,34 @@ def build_context(
     key_levels: Dict[str, object],
     quality: Dict[str, object],
     relative_strength: Optional[Dict[str, object]] = None,
+    intraday: Optional[Dict[str, object]] = None,
     prompt_version: str = "",
     adjustment_note: str = "",
     timezone_name: str = "",
 ) -> Dict[str, object]:
-    """组装发送给大模型的 JSON（不包含任何密钥）。"""
+    """组装发送给大模型的 JSON（不包含任何密钥）。
+
+    ``intraday`` 为被排除出计算的盘中快照（若有）。这里会**显式**告诉模型：
+    解析用的收盘价/成交量是最后一个**已收盘**交易日的，盘中值仅供参考。
+    """
     warnings: List[str] = []
     warnings.extend(str(item) for item in (daily_snapshot.get("warnings") or []))
     warnings.extend(str(item) for item in (weekly_snapshot.get("warnings") or []))
 
     data_cutoff = quality.get("last_bar_date")
     weekly_bars = weekly_bars_payload(weekly_df)
+
+    if intraday:
+        intraday_note = (
+            "数据源最新一根 K 线（{date}）属于进行中的交易日，已在默认策略下排除出计算。"
+            "`price.close` 与全部技术指标均基于最后已收盘交易日（{cutoff}）。"
+            "`price.intraday` 中的 last 为盘中最新价、volume 为盘中累计成交量，**不完整**，"
+            "不得当作收盘价或全日成交量使用。".format(
+                date=intraday.get("date"), cutoff=data_cutoff
+            )
+        )
+    else:
+        intraday_note = "未检测到进行中的交易日：价格与成交量均为已收盘的日线数据。"
 
     context: Dict[str, object] = {
         "meta": {
@@ -127,6 +144,11 @@ def build_context(
             "warnings": list(quality.get("warnings") or []),
             "indicator_warnings": warnings,
             "last_bar_incomplete": bool(quality.get("incomplete_bar")),
+            "source_last_bar_date": quality.get("source_last_bar_date"),
+            "source_last_bar_incomplete": bool(quality.get("source_last_bar_incomplete")),
+            "intraday_excluded": bool(quality.get("intraday_excluded")),
+            "intraday_reason": quality.get("incomplete_reason"),
+            "intraday_note": intraday_note,
             "adjusted": quality.get("adjusted"),
             "adjustment_note": quality.get("adjustment_note"),
             "weekly_notes": list(weekly_df.attrs.get("warnings", [])) if hasattr(weekly_df, "attrs") else [],
@@ -136,9 +158,11 @@ def build_context(
         },
         "price": {
             "close": daily_snapshot.get("close"),
+            "close_basis": "最后已收盘交易日的收盘价（技术指标与关键价位均基于它）",
             "recent_daily_bars": daily_bars_payload(daily_df),
             "recent_weekly_bars": weekly_bars,
-            "recent_daily_bars_note": f"最近 {len(daily_bars_payload(daily_df))} 个交易日的日 K 线",
+            "intraday": intraday,
+            "recent_daily_bars_note": f"最近 {len(daily_bars_payload(daily_df))} 个已收盘交易日的日 K 线",
             "recent_weekly_bars_note": (
                 f"最近 {len(weekly_bars)} 根已结束交易周的周 K 线（进行中的交易周已剔除）"
             ),
